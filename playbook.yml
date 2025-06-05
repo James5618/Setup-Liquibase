@@ -1,0 +1,176 @@
+---
+- name: Setup Liquibase with PostgreSQL 16 on Oracle Linux 8
+  hosts: liquibase_server
+  become: true
+
+  vars:
+    liquibase_version: "4.27.0"
+    liquibase_install_dir: "/opt/liquibase"
+    liquibase_user: liquibase-admin
+    postgres_db: liquibase_db
+    postgres_user: liquibase_dba
+    postgres_password: password
+    postgres_version: "16"
+
+  tasks:
+    - name: Ensure required packages are installed (Java 17)
+      dnf:
+        name:
+          - java-17-openjdk
+          - java-17-openjdk-devel
+          - wget
+          - unzip
+        state: present
+        update_cache: yes
+
+    - name: Set Java 17 as the default java alternative
+      alternatives:
+        name: java
+        path: /usr/lib/jvm/java-17-openjdk/bin/java
+
+    - name: Configure JAVA_HOME globally in /etc/profile.d/java.sh
+      copy:
+        dest: /etc/profile.d/java.sh
+        content: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+          export PATH=$JAVA_HOME/bin:$PATH
+        mode: '0644'
+
+    - name: Create Liquibase user
+      user:
+        name: "{{ liquibase_user }}"
+        create_home: yes
+        shell: /bin/bash
+
+    - name: Create Liquibase install directory
+      file:
+        path: "{{ liquibase_install_dir }}"
+        state: directory
+        owner: "{{ liquibase_user }}"
+        mode: '0755'
+
+    - name: Download Liquibase
+      get_url:
+        url: "https://github.com/liquibase/liquibase/releases/download/v{{ liquibase_version }}/liquibase-{{ liquibase_version }}.tar.gz"
+        dest: "/tmp/liquibase.tar.gz"
+
+    - name: Extract Liquibase
+      unarchive:
+        src: "/tmp/liquibase.tar.gz"
+        dest: "{{ liquibase_install_dir }}"
+        remote_src: yes
+
+    - name: Create symlink for liquibase
+      file:
+        src: "{{ liquibase_install_dir }}/liquibase"
+        dest: /usr/local/bin/liquibase
+        state: link
+        force: yes
+
+    - name: Download PostgreSQL Yum repo for version 16
+      get_url:
+        url: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+        dest: "/tmp/pgdg-redhat-repo.rpm"
+
+    - name: Install PostgreSQL repo RPM
+      yum:
+        name: "/tmp/pgdg-redhat-repo.rpm"
+        state: present
+
+    - name: Disable built-in PostgreSQL module
+      command: dnf -qy module disable postgresql
+      args:
+        creates: "/etc/dnf/modules.d/postgresql.module"
+
+    - name: Install PostgreSQL 16 server and contrib packages
+      dnf:
+        name:
+          - postgresql16
+          - postgresql16-server
+          - postgresql16-contrib
+        state: present
+
+    - name: Initialize PostgreSQL 16 database
+      command: "/usr/pgsql-16/bin/postgresql-16-setup initdb"
+      args:
+        creates: "/var/lib/pgsql/16/data/PG_VERSION"
+
+    - name: Enable and start PostgreSQL 16
+      service:
+        name: postgresql-16
+        state: started
+        enabled: yes
+
+    - name: Allow password authentication in pg_hba.conf
+      lineinfile:
+        path: "/var/lib/pgsql/16/data/pg_hba.conf"
+        regexp: '^host\s+all\s+all\s+127\.0\.0\.1/32\s+.*$'
+        line: 'host    all             all             127.0.0.1/32            md5'
+        backup: yes
+
+    - name: Reload PostgreSQL 16 to apply authentication changes
+      service:
+        name: postgresql-16
+        state: restarted
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      postgresql_user:
+        name: "{{ postgres_user }}"
+        password: "{{ postgres_password }}"
+        role_attr_flags: "LOGIN"
+
+    - name: Create PostgreSQL database
+      become_user: postgres
+      postgresql_db:
+        name: "{{ postgres_db }}"
+        owner: "{{ postgres_user }}"
+
+    - name: Ensure firewalld is installed
+      dnf:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld is enabled and running
+      service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open PostgreSQL port (5432) in firewalld
+      firewalld:
+        port: 5432/tcp
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Reload firewalld
+      firewalld:
+        state: reloaded
+
+    - name: Copy Liquibase properties file
+      template:
+        src: liquibase.properties.j2
+        dest: "/home/{{ liquibase_user }}/liquibase.properties"
+        owner: "{{ liquibase_user }}"
+        mode: '0644'
+
+    - name: Copy changelog file
+      copy:
+        src: db.changelog-master.xml
+        dest: "/home/{{ liquibase_user }}/db.changelog-master.xml"
+        owner: "{{ liquibase_user }}"
+        mode: '0644'
+
+    - name: Download PostgreSQL JDBC driver
+      get_url:
+        url: "https://jdbc.postgresql.org/download/postgresql-42.7.3.jar"
+        dest: "{{ liquibase_install_dir }}/postgresql.jar"
+
+    - name: Run Liquibase update
+      become_user: "{{ liquibase_user }}"
+      shell: |
+        liquibase --defaultsFile=/home/{{ liquibase_user }}/liquibase.properties update
+      args:
+        chdir: "/home/{{ liquibase_user }}"
+
